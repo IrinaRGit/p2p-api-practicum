@@ -1,0 +1,172 @@
+---
+description: How we test the P2P API — the docs are the oracle, black-box only, own data per test, positive/negative/error per endpoint, schema checks, one tag, evidence labels.
+globs: tests/**
+alwaysApply: false
+---
+
+# API testing rules (P2P practice API)
+
+## 1. Oracle
+
+`docs/API.md` and `/openapi.json` define correct behavior. If the running API disagrees, keep the documented expectation and let the test fail — do not weaken or rewrite the assertion to match the bug; report it. Behavior that neither document covers belongs in `docs/QUESTIONS.md` as **assumed until answered** — do not assert it until a human confirms.
+
+**Good**
+
+```ts
+// Docs: inactive vendor → 400 + inactive_vendor_gate (API.md rule 1)
+const res = await request.post('/purchase-orders', { data: { vendor_id: 'vnd-002', line_items: [...] } });
+expect(res.status()).toBe(400);
+expect((await res.json()).rule).toBe('inactive_vendor_gate');
+```
+
+**Bad**
+
+```ts
+// API returned 500 — “fix” the test to pass
+expect([400, 500]).toContain(res.status());
+```
+
+## 2. Black box
+
+Tests talk to the HTTP API only. Never import, read, or change anything under `src/`.
+
+**Good**
+
+```ts
+import { test, expect } from '@playwright/test';
+// helpers live under tests/ if needed
+```
+
+**Bad**
+
+```ts
+import { store } from '../../src/store.js'; // peeks at in-memory state
+```
+
+## 3. Requests
+
+Use Playwright’s `request` fixture with path-only URLs. Host and port come from `baseURL` in `playwright.config.ts` (`API_BASE_URL`).
+
+**Good**
+
+```ts
+const response = await request.get('/vendors');
+```
+
+**Bad**
+
+```ts
+const response = await request.get('http://localhost:8000/vendors');
+```
+
+## 4. Data
+
+Each test creates what it needs: its own vendor for exposure checks, `Date.now()` (or similar) for unique `invoice_number` values. Never call `POST /admin/reset` inside a spec — setup project `reset.setup.ts` runs once before the suite. Do not rely on another test’s records except steps in one serial `@e2e` flow.
+
+**Good**
+
+```ts
+const vendor = await request.post('/vendors', { data: { name: `Exposure Co ${Date.now()}` } });
+const { id: vendorId } = await vendor.json();
+```
+
+**Bad**
+
+```ts
+await request.post('/admin/reset'); // belongs in setup only
+await request.get('/vendors/vnd-001/exposure'); // assumes no prior tests touched vnd-001
+```
+
+## 5. Per endpoint
+
+Cover each endpoint you touch with three cases when applicable: **positive** (happy path), **negative** (one invalid input or rule violation at a time → `400` with `validation_error` or the named business rule), **error** (unknown id or missing route → `404`).
+
+**Good** (for `POST /vendors`)
+
+- Positive: valid `name` → `201`
+- Negative: `{ "name": "" }` → `400`, `rule: 'validation_error'`
+- Error: N/A for create; use `GET /vendors/{vendorId}/exposure` with `vnd-nope` → `404`
+
+**Bad**
+
+```ts
+test('POST /vendors works', async ({ request }) => {
+  expect((await request.post('/vendors', { data: { name: 'OK' } })).status()).toBe(201);
+  // no empty-name negative, no exposure 404 on another endpoint
+});
+```
+
+## 6. Assertions
+
+Assert status; for every `400`, the exact `rule` string from the docs; field values that matter (amounts, statuses, ids), not merely `toHaveProperty`; response shape via `expectSchema` (P48) against OpenAPI component schemas. A `400` with the wrong `rule` is a failure.
+
+**Good**
+
+```ts
+expect(res.status()).toBe(400);
+const body = await res.json();
+expect(body.rule).toBe('duplicate_invoice_detection');
+await expectSchema(body, 'Error');
+expect(body.detail).toMatch(/invoice number/i);
+```
+
+**Bad**
+
+```ts
+expect(res.status()).toBe(400);
+expect(await res.json()).toHaveProperty('detail'); // rule not checked
+```
+
+## 7. Tags
+
+Exactly one tag per test: `{ tag: '@api' }` for a single-endpoint case, `{ tag: '@e2e' }` for a multi-step flow. Put the tag on `test()`, never on `describe()`.
+
+**Good**
+
+```ts
+test('GET /health returns ok', { tag: '@api' }, async ({ request }) => { ... });
+test('draft PO through approve updates exposure', { tag: '@e2e' }, async ({ request }) => { ... });
+```
+
+**Bad**
+
+```ts
+test.describe('vendors', { tag: '@api' }, () => { ... });
+```
+
+## 8. Known bugs
+
+When a bug is confirmed, keep the strict assertion and mark the test with `test.fail(true, 'BUG-<n>: <one line>')`. Do not delete the test or loosen expectations.
+
+**Good**
+
+```ts
+test.fail(true, 'BUG-3: POST /invoices accepts duplicate INV-7 vs inv-7');
+test('duplicate invoice numbers rejected', { tag: '@api' }, async ({ request }) => {
+  // full assertions unchanged
+});
+```
+
+**Bad**
+
+```ts
+// test removed because it fails in CI
+// or: expect(res.status()).toBeLessThan(500);
+```
+
+## 9. Evidence
+
+Label every behavioral claim in tests, helpers, or `docs/QUESTIONS.md` with one of: **executed** (verified by a passing test run), **inspected only** (read API.md/OpenAPI or manual call, not automated), **not yet tested** (planned assertion missing).
+
+**Good**
+
+```ts
+// inactive_vendor_gate on vnd-002 — executed
+test('POST /purchase-orders rejects inactive vendor', { tag: '@api' }, async ({ request }) => { ... });
+```
+
+**Bad**
+
+```ts
+// Docs say receive over ordered qty is receive_quantity_limit — no test, unlabeled comment in spec
+```
